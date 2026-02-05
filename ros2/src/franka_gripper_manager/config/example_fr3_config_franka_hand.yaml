@@ -1,2 +1,2 @@
 robot1:
-  namespace: ""
+  namespace: "panda_gripper"
