@@ -28,12 +28,33 @@ from geometry_msgs.msg import WrenchStamped, TwistStamped
 @dataclass
 class DataCollectionConfig:
     """Configuration for data collection."""
+    task_type: str = "reach"  # "reach", "pick", or add new ones
+
+    # Reach task config
     target_ee_pose: np.ndarray = field(
         default_factory=lambda: np.array([0.51121, -0.00682, 0.275706, -3.12343, 0.02347, -0.01645])
     )
     reward_threshold: np.ndarray = field(
         default_factory=lambda: np.array([0.02, 0.02, 0.02, 0.5, 0.5, 0.5])
     )
+    check_rotation_z: bool = False  # Also require rotation-z within reward_threshold[5]
+
+    # Pick task config
+    object_z: float = 0.03
+    lift_height: float = 0.10
+    gripper_closed_min: float = 0.002
+    gripper_closed_max: float = 0.035
+
+    # Slide task config (AprilTag goal + HSV object)
+    tag_family: str = "tagStandard41h12"
+    goal_tag_id: int = 5     # Tag on the goal area
+    green_hsv_low: list = field(default_factory=lambda: [35, 50, 50])
+    green_hsv_high: list = field(default_factory=lambda: [85, 255, 255])
+    min_contour_area: int = 50
+    success_pixel_distance: float = 15.0
+    _tag_detector: object = None  # lazy-initialized
+    _goal_centroid: Optional[np.ndarray] = None  # cached, detected once
+
     camera_topic: str = "/zed/zed_node/left/image_rect_color"
     robot_joint_states_topic: str = "/joint_states"
     franka_wrench_topic: str = "/franka_robot_state_broadcaster/external_wrench_in_stiffness_frame"
@@ -44,8 +65,99 @@ class DataCollectionConfig:
     control_rate: float = 1.0
     max_episode_steps: int = 100
     image_size: tuple = (128, 128)
+    extra_image_size: tuple = None  # If set (e.g. (224, 224)), saves a second pkl with this image size
     output_dir: str = "./collected_data"
     num_episodes: int = 20
+
+
+# --- Success checkers: each takes (config, ee_pose, gripper_pos, image=None) -> bool ---
+
+def _check_success_reach(config, ee_pose, gripper_pos, image=None, image_full=None):
+    """Success = EE pose within threshold of target."""
+    delta = np.abs(ee_pose - config.target_ee_pose)
+    success = bool(np.all(delta[:3] <= config.reward_threshold[:3]))
+    if success and config.check_rotation_z:
+        success = bool(delta[5] <= config.reward_threshold[5])
+    return success
+
+
+def _check_success_pick(config, ee_pose, gripper_pos, image=None, image_full=None):
+    """Success = tcp_z >= lift_height (absolute z above table) while gripper is holding object."""
+    tcp_z = ee_pose[2]
+    is_lifted = tcp_z >= config.lift_height
+    is_holding = config.gripper_closed_min <= gripper_pos <= config.gripper_closed_max
+    return bool(is_lifted and is_holding)
+
+
+def _detect_goal_tag(image_bgr, tag_detector, tag_id):
+    """Detect goal AprilTag centroid in the image."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    detections = tag_detector.detect(gray)
+    centers = [np.array(d.center) for d in detections if d.tag_id == tag_id]
+    if not centers:
+        return None
+    return np.mean(centers, axis=0)
+
+
+def _detect_green_object(image_bgr, hsv_low, hsv_high, min_area):
+    """Detect green object centroid via HSV color detection."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(hsv_low), np.array(hsv_high))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = [c for c in contours if cv2.contourArea(c) >= min_area]
+    if not valid:
+        return None
+    largest = max(valid, key=cv2.contourArea)
+    M = cv2.moments(largest)
+    if M["m00"] == 0:
+        return None
+    return np.array([M["m10"] / M["m00"], M["m01"] / M["m00"]])
+
+
+def _check_success_slide(config, ee_pose, gripper_pos, image=None, image_full=None):
+    """Success = green object centroid is close to goal AprilTag centroid.
+
+    Uses full-res image for detection when available, falls back to 128x128.
+    """
+    detect_image = image_full if image_full is not None else image
+    if detect_image is None:
+        return False
+
+    # Lazy-init detector
+    if not hasattr(config, '_tag_detector') or config._tag_detector is None:
+        from pupil_apriltags import Detector
+        config._tag_detector = Detector(families=config.tag_family, quad_decimate=1.0)
+
+    # Detect goal centroid once and cache it (on full-res for reliable AprilTag detection)
+    if config._goal_centroid is None:
+        config._goal_centroid = _detect_goal_tag(
+            detect_image, config._tag_detector, config.goal_tag_id
+        )
+        if config._goal_centroid is not None:
+            print(f"[Slide] Detected goal tag (id={config.goal_tag_id}) at pixel "
+                  f"({config._goal_centroid[0]:.1f}, {config._goal_centroid[1]:.1f})")
+        else:
+            return False
+
+    object_centroid = _detect_green_object(
+        detect_image, config.green_hsv_low, config.green_hsv_high, config.min_contour_area
+    )
+    if object_centroid is None:
+        return False
+
+    distance = np.linalg.norm(object_centroid - config._goal_centroid)
+    # Scale success_pixel_distance if using full-res crop (threshold is tuned for 128x128)
+    threshold = config.success_pixel_distance
+    if image_full is not None:
+        threshold *= image_full.shape[0] / 128.0
+    return bool(distance < threshold)
+
+
+SUCCESS_CHECKERS = {
+    "reach": _check_success_reach,
+    "pick": _check_success_pick,
+    "slide": _check_success_slide,
+}
 
 
 class GelloDataCollector(Node):
@@ -63,6 +175,8 @@ class GelloDataCollector(Node):
         # State variables
         self._lock = threading.Lock()
         self._latest_image: Optional[np.ndarray] = None
+        self._latest_image_extra: Optional[np.ndarray] = None  # Extra resolution image
+        self._latest_image_full: Optional[np.ndarray] = None
         self._latest_robot_joints: Optional[np.ndarray] = None
         self._latest_franka_gripper: float = 0.0
         self._latest_ee_pose: Optional[np.ndarray] = None
@@ -161,9 +275,16 @@ class GelloDataCollector(Node):
 
             ee_pose = self._get_ee_pose_from_tf()
 
+            resized_full = cropped  # Native crop resolution for detection
+            resized_extra = None
+            if self.config.extra_image_size is not None:
+                resized_extra = cv2.resize(cropped, self.config.extra_image_size)
+
             if len(joint_positions) == 7:
                 with self._lock:
                     self._latest_image = resized
+                    self._latest_image_extra = resized_extra
+                    self._latest_image_full = resized_full  # 512x512 for detection
                     self._latest_robot_joints = np.array(joint_positions)
                     if ee_pose is not None:
                         self._latest_ee_pose = ee_pose
@@ -220,10 +341,16 @@ class GelloDataCollector(Node):
             # Image: BGR to RGB, uint8 [0, 255]
             image = self._latest_image[..., ::-1].copy()
 
-            return {
+            obs = {
                 "states": torch.tensor(states, dtype=torch.float32),
                 "main_images": torch.tensor(image, dtype=torch.uint8),
             }
+
+            if self._latest_image_extra is not None:
+                image_extra = self._latest_image_extra[..., ::-1].copy()
+                obs["_extra_image"] = torch.tensor(image_extra, dtype=torch.uint8)
+
+            return obs
 
     def _compute_action(self, obs: dict, next_obs: dict) -> np.ndarray:
         """Compute 7D action: EE delta (6D) + gripper (1D)."""
@@ -244,8 +371,12 @@ class GelloDataCollector(Node):
         with self._lock:
             if self._latest_ee_pose is None:
                 return False
-            delta = np.abs(self._latest_ee_pose - self.config.target_ee_pose)
-            return np.all(delta[:3] <= self.config.reward_threshold[:3])
+            checker = SUCCESS_CHECKERS.get(self.config.task_type)
+            if checker is None:
+                raise ValueError(f"Unknown task_type '{self.config.task_type}'. "
+                                 f"Available: {list(SUCCESS_CHECKERS.keys())}")
+            return checker(self.config, self._latest_ee_pose, self._latest_franka_gripper,
+                           image=self._latest_image, image_full=self._latest_image_full)
 
     def _control_loop(self):
         if not self._episode_active:
@@ -297,6 +428,11 @@ class GelloDataCollector(Node):
         self._episode_active = False
         if is_success:
             self._success_count += 1
+            # Mark success on episode data (needed when 's' is pressed manually,
+            # since _episode_success may not have been set by the auto-checker)
+            if self.episode_data:
+                self.episode_data[-1]["reward"] = 1.0
+                self.episode_data[-1]["done"] = True
 
         # Convert episode data to RLinf format
         for trans in self.episode_data:
@@ -322,49 +458,58 @@ class GelloDataCollector(Node):
             self._running = False
 
     def _save_data(self):
-        """Save data with minmax normalized actions."""
+        """Save data with raw (unnormalized) actions in absolute frame."""
         if not self.data_list:
             return
 
-        # Collect all actions for normalization
-        all_actions = np.array([d["action"].numpy() for d in self.data_list])
-
-        # Compute minmax for 6D EE delta (exclude gripper)
-        ee_actions = all_actions[:, :6]
-        action_min = ee_actions.min(axis=0)
-        action_max = ee_actions.max(axis=0)
-        action_range = action_max - action_min
-        action_range = np.where(action_range < 1e-8, 1.0, action_range)
-
-        # Normalize and save
-        normalized_data = []
-        for d in self.data_list:
-            d_new = d.copy()
-            action = d["action"].numpy()
-
-            # Normalize 6D EE to [-1, 1]
-            ee_norm = 2 * (action[:6] - action_min) / action_range - 1
-            ee_norm = np.clip(ee_norm, -1, 1)
-
-            # Keep gripper as-is (already -1 or 1)
-            normalized_action = np.concatenate([ee_norm, action[6:7]])
-            d_new["action"] = torch.tensor(normalized_action, dtype=torch.float32)
-            normalized_data.append(d_new)
-
-        # Save data
         os.makedirs(self.config.output_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(self.config.output_dir, f"gello_data_{timestamp}.pkl")
 
+        # Save main pkl (128x128 images, without _extra_image key)
+        main_data = []
+        extra_data = []
+        has_extra = self.config.extra_image_size is not None
+
+        for sample in self.data_list:
+            # Split out _extra_image from obs and next_obs
+            main_sample = dict(sample)
+            main_sample["transitions"] = {}
+            for tkey in ["obs", "next_obs"]:
+                if tkey in sample["transitions"]:
+                    obs = dict(sample["transitions"][tkey])
+                    extra_img = obs.pop("_extra_image", None)
+                    main_sample["transitions"][tkey] = obs
+
+                    if has_extra and extra_img is not None:
+                        # Build extra sample lazily below
+                        pass
+
+            main_data.append(main_sample)
+
+            if has_extra:
+                # Build extra sample: same structure but main_images replaced with extra size
+                extra_sample = dict(sample)
+                extra_sample["transitions"] = {}
+                for tkey in ["obs", "next_obs"]:
+                    if tkey in sample["transitions"]:
+                        obs = dict(sample["transitions"][tkey])
+                        extra_img = obs.pop("_extra_image", None)
+                        if extra_img is not None:
+                            obs["main_images"] = extra_img
+                        extra_sample["transitions"][tkey] = obs
+                extra_data.append(extra_sample)
+
         with open(filepath, "wb") as f:
-            pkl.dump(normalized_data, f)
+            pkl.dump(main_data, f)
+        self.get_logger().info(f"Saved {len(main_data)} transitions to {filepath}")
 
-        # Save normalization params
-        norm_params = {"min": action_min, "max": action_max, "range": action_range}
-        with open(filepath.replace(".pkl", "_norm_params.pkl"), "wb") as f:
-            pkl.dump(norm_params, f)
-
-        self.get_logger().info(f"Saved {len(normalized_data)} transitions to {filepath}")
+        if has_extra and extra_data:
+            w, h = self.config.extra_image_size
+            extra_path = os.path.join(self.config.output_dir, f"gello_data_{timestamp}_{w}x{h}.pkl")
+            with open(extra_path, "wb") as f:
+                pkl.dump(extra_data, f)
+            self.get_logger().info(f"Saved {len(extra_data)} transitions ({w}x{h}) to {extra_path}")
 
     def _keyboard_input_loop(self):
         import sys, select, termios, tty
@@ -397,21 +542,57 @@ class GelloDataCollector(Node):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", default="reach", choices=list(SUCCESS_CHECKERS.keys()),
+                        help="Task type for success condition")
     parser.add_argument("--output-dir", default="./collected_data")
     parser.add_argument("--num-episodes", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--control-rate", type=float, default=1.0)
     parser.add_argument("--camera-topic", default="/zed/zed_node/left/image_rect_color")
+    # Reach task args
     parser.add_argument("--target-pose", type=float, nargs=6, default=[0.5, 0.0, 0.3, -3.14, 0.0, 0.0])
     parser.add_argument("--threshold", type=float, nargs=6, default=[0.02, 0.02, 0.02, 0.1, 0.1, 0.1])
+    # Pick task args
+    parser.add_argument("--object-z", type=float, default=0.03)
+    parser.add_argument("--lift-height", type=float, default=0.10)
+    parser.add_argument("--gripper-closed-min", type=float, default=0.002)
+    parser.add_argument("--gripper-closed-max", type=float, default=0.035)
+    # Slide task args
+    # Slide task args
+    parser.add_argument("--success-pixel-distance", type=float, default=7.0,
+                        help="Pixel distance threshold for slide task success (in 128x128 px)")
+    parser.add_argument("--goal-tag-id", type=int, default=5, help="AprilTag ID for slide goal")
+    parser.add_argument("--green-hsv-low", type=int, nargs=3, default=[35, 50, 50])
+    parser.add_argument("--green-hsv-high", type=int, nargs=3, default=[85, 255, 255])
+    parser.add_argument("--min-contour-area", type=int, default=50)
+    parser.add_argument("--extra-image-size", type=int, default=None,
+                        help="If set, also save a second pkl with images at this resolution (e.g. 224)")
+    parser.add_argument("--check-rotation-z", action="store_true", default=False,
+                        help="Also require rotation-z within threshold[5] for reach success")
     args = parser.parse_args()
 
+    extra_image_size = None
+    if args.extra_image_size is not None:
+        extra_image_size = (args.extra_image_size, args.extra_image_size)
+
     config = DataCollectionConfig(
+        task_type=args.task,
         target_ee_pose=np.array(args.target_pose),
         reward_threshold=np.array(args.threshold),
+        check_rotation_z=args.check_rotation_z,
+        object_z=args.object_z,
+        lift_height=args.lift_height,
+        gripper_closed_min=args.gripper_closed_min,
+        gripper_closed_max=args.gripper_closed_max,
+        success_pixel_distance=args.success_pixel_distance,
+        goal_tag_id=args.goal_tag_id,
+        green_hsv_low=args.green_hsv_low,
+        green_hsv_high=args.green_hsv_high,
+        min_contour_area=args.min_contour_area,
         camera_topic=args.camera_topic,
         control_rate=args.control_rate,
         max_episode_steps=args.max_steps,
+        extra_image_size=extra_image_size,
         output_dir=args.output_dir,
         num_episodes=args.num_episodes,
     )
