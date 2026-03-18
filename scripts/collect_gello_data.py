@@ -16,7 +16,7 @@ import torch
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
-from sensor_msgs.msg import JointState, Image
+from sensor_msgs.msg import JointState, Image, CameraInfo
 from cv_bridge import CvBridge
 import message_filters
 from message_filters import ApproximateTimeSynchronizer
@@ -38,6 +38,7 @@ class DataCollectionConfig:
         default_factory=lambda: np.array([0.02, 0.02, 0.02, 0.5, 0.5, 0.5])
     )
     check_rotation_z: bool = False  # Also require rotation-z within reward_threshold[5]
+    require_gripper_open: bool = False  # Also require gripper to be open for reach success
 
     # Pick task config
     object_z: float = 0.03
@@ -69,15 +70,24 @@ class DataCollectionConfig:
     output_dir: str = "./collected_data"
     num_episodes: int = 20
 
+    # Rich observation pkl (separate file with full-res rgb, depth, joints, gripper_pose)
+    save_obs_pkl: bool = False
+    depth_topic: str = "/zed/zed_node/depth/depth_registered"
+    camera_info_topic: str = "/zed/zed_node/left/camera_info"
+    # 4x4 camera-to-robot extrinsics, row-major flat list of 16 values (optional)
+    camera_extrinsics: Optional[list] = None
+
 
 # --- Success checkers: each takes (config, ee_pose, gripper_pos, image=None) -> bool ---
 
 def _check_success_reach(config, ee_pose, gripper_pos, image=None, image_full=None):
-    """Success = EE pose within threshold of target."""
+    """Success = EE pose within threshold of target, optionally with gripper open."""
     delta = np.abs(ee_pose - config.target_ee_pose)
     success = bool(np.all(delta[:3] <= config.reward_threshold[:3]))
     if success and config.check_rotation_z:
         success = bool(delta[5] <= config.reward_threshold[5])
+    if success and config.require_gripper_open:
+        success = gripper_pos > 0.04  # sum of both finger positions
     return success
 
 
@@ -179,6 +189,10 @@ class GelloDataCollector(Node):
         self._latest_image_full: Optional[np.ndarray] = None
         self._latest_robot_joints: Optional[np.ndarray] = None
         self._latest_franka_gripper: float = 0.0
+        self._latest_gripper_joints: np.ndarray = np.zeros(2)
+        self._latest_image_native: Optional[np.ndarray] = None  # full native res, no crop
+        self._latest_depth: Optional[np.ndarray] = None
+        self._camera_intrinsics: Optional[np.ndarray] = None
         self._latest_ee_pose: Optional[np.ndarray] = None
         self._latest_tcp_force: np.ndarray = np.zeros(3)
         self._latest_tcp_torque: np.ndarray = np.zeros(3)
@@ -189,6 +203,10 @@ class GelloDataCollector(Node):
         self._received_robot_joints = False
         self._received_franka_gripper = False
         self._received_tf = False
+
+        # Rich obs pkl state
+        self._obs_episodes: list = []
+        self._current_obs_episode: list = []
 
         # Episode state
         self._episode_active = False
@@ -219,6 +237,17 @@ class GelloDataCollector(Node):
         self.franka_twist_sub = self.create_subscription(
             TwistStamped, config.franka_twist_topic, self._franka_twist_callback, 10
         )
+
+        # Optional: depth + camera_info for obs pkl
+        if config.save_obs_pkl:
+            if config.depth_topic:
+                self.depth_sub = self.create_subscription(
+                    Image, config.depth_topic, self._depth_callback, 10
+                )
+            if config.camera_info_topic:
+                self.camera_info_sub = self.create_subscription(
+                    CameraInfo, config.camera_info_topic, self._camera_info_callback, 1
+                )
 
         # Control timer
         self.control_timer = self.create_timer(1.0 / config.control_rate, self._control_loop)
@@ -276,6 +305,9 @@ class GelloDataCollector(Node):
             ee_pose = self._get_ee_pose_from_tf()
 
             resized_full = cropped  # Native crop resolution for detection
+            if self.config.save_obs_pkl:
+                with self._lock:
+                    self._latest_image_native = cv_image.copy()  # full native res, no crop
             resized_extra = None
             if self.config.extra_image_size is not None:
                 resized_extra = cv2.resize(cropped, self.config.extra_image_size)
@@ -302,9 +334,13 @@ class GelloDataCollector(Node):
 
     def _franka_gripper_callback(self, msg: JointState):
         try:
-            gripper_pos = sum(msg.position[:2]) if len(msg.position) >= 2 else msg.position[0] * 2
+            if len(msg.position) >= 2:
+                fingers = np.array([msg.position[0], msg.position[1]])
+            else:
+                fingers = np.array([msg.position[0], msg.position[0]])
             with self._lock:
-                self._latest_franka_gripper = gripper_pos
+                self._latest_franka_gripper = float(fingers.sum())
+                self._latest_gripper_joints = fingers
                 if not self._received_franka_gripper:
                     self._received_franka_gripper = True
                     self.get_logger().info(f"[OK] Gripper")
@@ -322,6 +358,65 @@ class GelloDataCollector(Node):
                 msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z,
                 msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z
             ])
+
+    def _depth_callback(self, msg: Image):
+        try:
+            if msg.encoding == "32FC1":
+                depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            elif msg.encoding == "16UC1":
+                depth_mm = self.bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
+                depth = depth_mm.astype(np.float32) / 1000.0
+            else:
+                depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough").astype(np.float32)
+            with self._lock:
+                self._latest_depth = depth.copy()  # full native resolution, no crop
+        except Exception as e:
+            self.get_logger().warning(f"Depth callback error: {e}")
+
+    def _camera_info_callback(self, msg: CameraInfo):
+        if self._camera_intrinsics is not None:
+            return  # Already captured once
+        # Save raw K for the native resolution — no crop adjustment needed since
+        # rgb and depth are saved at full native resolution.
+        K = np.array(msg.k).reshape(3, 3).copy()
+        with self._lock:
+            self._camera_intrinsics = K
+        self.get_logger().info(
+            f"[OK] Intrinsics: fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
+            f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}"
+        )
+
+    def _get_obs_step(self) -> Optional[dict]:
+        """Build a rich obs dict for the separate obs pkl (called from _control_loop)."""
+        with self._lock:
+            if self._latest_image_native is None or self._latest_ee_pose is None:
+                return None
+            rgb = self._latest_image_native.copy()  # full native resolution BGR, no crop
+            depth = self._latest_depth.copy() if self._latest_depth is not None else None
+            intrinsics = self._camera_intrinsics.copy() if self._camera_intrinsics is not None else None
+            gripper_joints = self._latest_gripper_joints.copy()
+            gripper_open = bool(gripper_joints.sum() > 0.04)
+            joints = self._latest_robot_joints.copy() if self._latest_robot_joints is not None else np.zeros(7)
+            ee = self._latest_ee_pose.copy()
+
+        T = np.eye(4)
+        T[:3, :3] = R.from_euler('xyz', ee[3:]).as_matrix()
+        T[:3, 3] = ee[:3]
+
+        extrinsics = None
+        if self.config.camera_extrinsics is not None:
+            extrinsics = np.array(self.config.camera_extrinsics).reshape(4, 4)
+
+        return {
+            "rgb": rgb,                    # (H, W, 3) uint8 BGR, full native resolution
+            "depth": depth,                # (H, W) float32 meters, full native resolution, or None
+            "intrinsics": intrinsics,      # (3, 3) K matrix for native resolution, or None
+            "extrinsics": extrinsics,      # (4, 4) T_cam_to_robot, or None
+            "gripper_open": gripper_open,  # bool
+            "gripper_joints": gripper_joints,  # (2,) float64, [left, right] finger pos in m
+            "joints": joints,              # (7,) float64, joint angles in rad
+            "gripper_pose": T,             # (4, 4) SE(3) base->EE
+        }
 
     def _get_observation(self) -> Optional[dict]:
         """Get observation in RLinf training format."""
@@ -386,6 +481,11 @@ class GelloDataCollector(Node):
         if obs is None:
             return
 
+        if self.config.save_obs_pkl:
+            obs_step = self._get_obs_step()
+            if obs_step is not None:
+                self._current_obs_episode.append(obs_step)
+
         if self._episode_step > 0 and self._check_success() and not self._episode_success:
             self._episode_success = True
             self.get_logger().info(f"Success at step {self._episode_step}!")
@@ -417,6 +517,7 @@ class GelloDataCollector(Node):
         self._episode_step = 0
         self._episode_success = False
         self.episode_data = []
+        self._current_obs_episode = []
         self._episode_count += 1
         with self._lock:
             self._latest_ee_pose = None
@@ -451,6 +552,9 @@ class GelloDataCollector(Node):
             })
 
         self.episode_data = []
+        if self.config.save_obs_pkl and self._current_obs_episode:
+            self._obs_episodes.append(self._current_obs_episode)
+        self._current_obs_episode = []
         self.get_logger().info(f"Episode {self._episode_count}: {'SUCCESS' if is_success else 'TIMEOUT'} ({self._success_count}/{self._episode_count})")
 
         if self._success_count >= self.config.num_episodes:
@@ -503,6 +607,27 @@ class GelloDataCollector(Node):
         with open(filepath, "wb") as f:
             pkl.dump(main_data, f)
         self.get_logger().info(f"Saved {len(main_data)} transitions to {filepath}")
+
+        if self.config.save_obs_pkl and self._obs_episodes:
+            obs_path = os.path.join(self.config.output_dir, f"drema_obs_{timestamp}.pkl")
+            with open(obs_path, "wb") as f:
+                pkl.dump(self._obs_episodes, f)
+            self.get_logger().info(
+                f"Saved {len(self._obs_episodes)} obs episodes to {obs_path}"
+            )
+
+            img_dir = os.path.join(self.config.output_dir, f"drema_obs_{timestamp}_images")
+            os.makedirs(img_dir, exist_ok=True)
+            for ep_idx, episode in enumerate(self._obs_episodes):
+                ep_dir = os.path.join(img_dir, f"episode_{ep_idx:03d}")
+                os.makedirs(ep_dir, exist_ok=True)
+                for step_idx, obs_step in enumerate(episode):
+                    cv2.imwrite(
+                        os.path.join(ep_dir, f"step_{step_idx:04d}.png"),
+                        obs_step["rgb"]  # already BGR, cv2.imwrite expects BGR
+                    )
+            total_imgs = sum(len(ep) for ep in self._obs_episodes)
+            self.get_logger().info(f"Saved {total_imgs} images to {img_dir}/")
 
         if has_extra and extra_data:
             w, h = self.config.extra_image_size
@@ -569,6 +694,14 @@ def main():
                         help="If set, also save a second pkl with images at this resolution (e.g. 224)")
     parser.add_argument("--check-rotation-z", action="store_true", default=False,
                         help="Also require rotation-z within threshold[5] for reach success")
+    parser.add_argument("--require-gripper-open", action="store_true", default=False,
+                        help="Also require gripper to be open for reach success")
+    parser.add_argument("--save-obs-pkl", action="store_true", default=False,
+                        help="Save a separate drema_obs_*.pkl with full-res rgb, depth, intrinsics, joints, gripper_pose")
+    parser.add_argument("--depth-topic", default="/zed/zed_node/depth/depth_registered")
+    parser.add_argument("--camera-info-topic", default="/zed/zed_node/left/camera_info")
+    parser.add_argument("--camera-extrinsics", type=float, nargs=16, default=None,
+                        metavar="V", help="4x4 T_cam_to_robot row-major (16 values)")
     args = parser.parse_args()
 
     extra_image_size = None
@@ -580,6 +713,7 @@ def main():
         target_ee_pose=np.array(args.target_pose),
         reward_threshold=np.array(args.threshold),
         check_rotation_z=args.check_rotation_z,
+        require_gripper_open=args.require_gripper_open,
         object_z=args.object_z,
         lift_height=args.lift_height,
         gripper_closed_min=args.gripper_closed_min,
@@ -595,6 +729,10 @@ def main():
         extra_image_size=extra_image_size,
         output_dir=args.output_dir,
         num_episodes=args.num_episodes,
+        save_obs_pkl=args.save_obs_pkl,
+        depth_topic=args.depth_topic,
+        camera_info_topic=args.camera_info_topic,
+        camera_extrinsics=args.camera_extrinsics,
     )
 
     rclpy.init()
