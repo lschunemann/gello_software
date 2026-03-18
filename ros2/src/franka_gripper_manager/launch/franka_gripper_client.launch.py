@@ -21,6 +21,15 @@ def generate_nodes(context):
     configs = load_yaml(config_file)
     nodes = []
     for item_name, config in configs.items():
+        params = {"namespace": str(config["namespace"])}
+        for key in [
+            "grasp_force",
+            "grasp_epsilon_inner",
+            "grasp_speed",
+            "move_speed",
+        ]:
+            if key in config:
+                params[key] = float(config[key])
         nodes.append(
             Node(
                 package="franka_gripper_manager",
@@ -28,7 +37,7 @@ def generate_nodes(context):
                 name="franka_gripper_client",
                 namespace=str(config["namespace"]),
                 output="screen",
-                parameters=[{"namespace": str(config["namespace"])}],
+                parameters=[params],
             )
         )
 
