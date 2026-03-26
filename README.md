@@ -11,6 +11,139 @@ For additional resources:
 - [Hardware Repository](https://github.com/wuphilipp/gello_mechanical) - STL files and build instructions
 - [ROS 2 Support](ros2/README.md)
 
+## Franka FR3 + GELLO Teleoperation Guide
+
+This section covers the end-to-end workflow for teleoperating a Franka FR3 with GELLO using the ROS 2 stack, collecting demonstration data, and postprocessing it for training.
+
+### Prerequisites
+
+- **Robot PC**: Connected to the Franka FR3 via Ethernet, running the Franka Control Interface (FCI).
+- **Operator PC**: Connected to the GELLO arm via USB (U2D2 or OpenRB-150), and to the robot PC via network. A ZED camera (or similar) should be connected if you need image observations.
+- Both PCs must have ROS 2 Humble installed and be on the same `ROS_DOMAIN_ID`.
+
+> The recommended setup uses the VS Code Dev Container in `ros2/.devcontainer/`. Open the `ros2/` folder in VS Code and select "Reopen in Container". See [ros2/README.md](ros2/README.md) for details.
+
+### Step 1: Build the workspace (already done, but if making changes)
+
+On both PCs (or in the Dev Container):
+
+```bash
+cd ros2
+colcon build --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+source install/setup.bash
+```
+
+### Step 2: Launch on the Robot PC
+
+Start the Franka arm controller and gripper manager. These connect to the robot via FCI:
+
+```bash
+# Terminal 1: Arm controller (joint impedance)
+ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py
+
+# Terminal 2: Gripper manager (Franka Hand) - if using (can also be controlled via robot pc keyboard)
+ros2 launch franka_gripper_manager franka_gripper_client.launch.py
+```
+
+Gripper grasp parameters (force, epsilon, speed) can be configured in the YAML config at `ros2/src/franka_gripper_manager/config/`. For example:
+```yaml
+robot1:
+  namespace: "panda_gripper"
+  grasp_force: 30.0        # Newtons (default: 20.0)
+  grasp_epsilon_inner: 0.05 # meters (default: 0.05)
+  grasp_speed: 1.0          # m/s (default: 1.0)
+  move_speed: 1.0           # m/s (default: 1.0)
+```
+
+### (Optional) Step 2.5: Connecting Gello to Operator PC (if unplugged or restarted)
+1. Plug in the Gello arm USB, connect its power adapter, and turn on the switch (you should see a red light at PWR on the U2D2 unit on the power hub board).
+2. If the VS Code dev container was started before the device was plugged in, it might have created directories. Remove them: ```bash rm -r /dev/ttyUSB0``` and: ```bash rm -r /dev/serial/by-id/{USB-id}```
+
+### Step 3: Launch on the Operator PC
+IMPORTANT: Before having both the Gello publisher and the Robot Joint Controller running, need to make sure the GELLO arm is in a reasonable configuration as the Franka will move quickly to replicate the joint positions. It is best to try and mimic the joint states of the Franka with the Gello arm. Also, it is best to try and keep the Gello arm steady while the Franka goes from rest to following the teleoperation, as movements here can lead to sudden movements of the Franka arm, which might lock the joints or result in collision!
+
+1. Ensure the Operator PC is connected to the Robot PC via Ethernet, and in the network settings, select the ROS profile for a static IP address.
+
+2. Start the GELLO state publisher to read the GELLO arm and publish joint commands:
+
+```bash
+ros2 launch franka_gello_state_publisher main.launch.py
+```
+
+The config file is in `ros2/src/franka_gello_state_publisher/config/`. See [ros2/README.md](ros2/README.md) for configuration details (joint offsets, gripper range, virtual springs/dampers).
+
+At this point, the robot should follow the GELLO arm.
+
+### Step 4: Collect demonstration data (for RLInf format)
+
+Run the data collection script on the operator PC (requires camera topic and TF):
+The target pose can be determined by moving the Franka end effector to the desired pose, either via the Gello, or via manual hand-guiding. The position can be read via the tf2 from franka_link_8 to franka_hand_tcp.
+
+```bash
+python scripts/collect_gello_data.py \
+    --task reach \
+    --output-dir ./collected_data \
+    --num-episodes 20 \
+    --max-steps 100 \
+    --control-rate 1.0 \
+    --camera-topic /zed/zed_node/left/image_rect_color \
+    --target-pose 0.5 0.0 0.3 -3.14 0.0 0.0 \
+    --threshold 0.02 0.02 0.02 0.1 0.1 0.1
+```
+
+**Keyboard controls during collection:**
+- `SPACE` — start / stop an episode
+- `S` — end episode and mark as success
+- `Q` — save all data and quit
+
+**Available task types** (`--task`):
+- `reach` — success when EE is near a target pose
+- `pick` — success when object is lifted above a height while gripper holds it
+- `slide` — success when a green object is pushed near an AprilTag goal (vision-based)
+
+**Optional flags:**
+- `--extra-image-size 224` — also save a second pkl with 224x224 images for the VLM reward critic
+- `--save-obs-pkl` — save a separate pkl with full-resolution RGB, depth, intrinsics, and gripper pose (for VLM / DreMA)
+- `--check-rotation-z` — also require z-rotation within threshold for reach success
+- `--require-gripper-open` — also require gripper open for reach success
+
+Output: `collected_data/gello_data_YYYYMMDD_HHMMSS.pkl` (raw, absolute frame).
+
+### Step 5: Postprocess demonstrations
+
+The raw pkl contains absolute EE poses. Use `process_demos.py` to filter and transform to the relative EE frame in one step:
+
+```bash
+python scripts/process_demos.py collected_data/gello_data_YYYYMMDD_HHMMSS.pkl \
+    --safety-box-min 0.3 -0.3 0.01 \
+    --safety-box-max 0.7 0.3 0.3 \
+    --action-scale 0.02 0.1 1.0 \
+    --action-dim 7 \
+    --keep-done \
+    --expected-episode-length 30 \
+    --sparse-reward
+```
+
+This pipeline applies, in order:
+1. **Done-fix** — removes duplicate done padding (or `--keep-done` to fix flags in-place)
+2. **Episode length check** — drops episodes with wrong length (`--expected-episode-length`)
+3. **Safety box filter** — removes transitions outside the specified workspace bounds
+4. **Relative frame transform** — converts TCP pose and velocity to EE-relative coordinates, using the first observation of each episode as the reset pose (or `--reset-pose` for a fixed one)
+5. **Near-zero action filter** — drops transitions with negligible actions
+6. **Sparse reward** (`--sparse-reward`) — only the last step of each trajectory gets reward=1.0
+
+Output auto-named: `gello_data_YYYYMMDD_HHMMSS_filtered_relative.pkl` (or `_sparse`, `_truncated` suffixes based on flags).
+
+Use `--dry-run` to preview statistics without saving.
+
+**Other useful scripts:**
+- `scripts/concat_demo_pkls.py file1.pkl file2.pkl -o combined.pkl` — merge multiple demo files
+- `scripts/visualize_pkl_data.py` — inspect collected data
+- `scripts/check_format_pkl.py` — validate pkl structure
+- `scripts/recompute_rewards.py` — recompute reward labels on existing data
+
+---
+
 ## Quick Start
 
 ```bash
